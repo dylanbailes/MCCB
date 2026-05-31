@@ -38,11 +38,11 @@ LOG_DIR    = os.path.expanduser("~/hall_logs")
 
 # ── Serial open ─────────────────────────────────────────────────────────────────
 
-def open_port():
+def open_port(port=PORT, baud=BAUD):
     try:
         ser = serial.Serial(
-            port        = PORT,
-            baudrate    = BAUD,
+            port        = port,
+            baudrate    = baud,
             bytesize    = serial.EIGHTBITS,
             parity      = serial.PARITY_NONE,
             stopbits    = serial.STOPBITS_ONE,
@@ -50,7 +50,7 @@ def open_port():
         )
         return ser
     except serial.SerialException as e:
-        print(f"[ERROR] Could not open {PORT}: {e}")
+        print(f"[ERROR] Could not open {port}: {e}")
         print("Check:")
         print("  1. /boot/firmware/config.txt has enable_uart=1 and dtoverlay=uart0-pi5")
         print("  2. raspi-config → Interface Options → Serial Port → login shell OFF")
@@ -360,12 +360,8 @@ def main():
     parser.add_argument("--baud",   default=BAUD, type=int, help=f"Baud rate (default: {BAUD})")
     args = parser.parse_args()
 
-    global PORT, BAUD
-    PORT = args.port
-    BAUD = args.baud
-
-    ser = open_port()
-    print(f"Opened {PORT} at {BAUD} baud.")
+    ser = open_port(args.port, args.baud)
+    print(f"Opened {args.port} at {args.baud} baud.")
 
     try:
         if args.stream:
