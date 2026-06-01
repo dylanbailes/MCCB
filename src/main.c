@@ -10,63 +10,63 @@
  *
  * ── DRV5055A1 specs at VCC = 3.3V ───────────────────────────────────────────
  *  Sensitivity:       60 mV/mT (typ), range 57–63 mV/mT
- *  Quiescent voltage: VCC/2 = 1.65V (1.59–1.71V)
+ *  Quiescent voltage: VCC/2 = 1.65V (1.59–1.71V tolerance)
  *  Linear range:      ±22 mT
  *  Bandwidth:         20 kHz
- *  Temp compensation: +0.12%/°C (A-series compensates for magnet drift)
  *
  * ── Ratiometric note ────────────────────────────────────────────────────────
  *  The DRV5055 output and quiescent point both scale with VCC.
- *  Since the STM32 ADC reference is also VCC, the ratio (ADC count / 4096)
- *  already cancels supply variation. We therefore work in "counts relative
- *  to midscale" and apply a fixed fractional sensitivity:
+ *  Since the STM32 ADC reference is also VCC, the ratio cancels supply
+ *  variation. Nominal midscale = 2048 counts. After boot calibration the
+ *  per-sensor zero_count replaces 2048 for all conversions.
  *
- *    S_frac = 60 mV/mT / 3300 mV = 0.018182 counts_fraction/mT
- *    => 1 LSB = VCC/4096, midscale = 2048 counts
- *    => delta_mT = (raw - 2048) / (4096 * S_frac)
- *               = (raw - 2048) / (4096 * 60/3300)
- *               = (raw - 2048) * 3300 / (4096 * 60)
+ * ── Zero-offset calibration ─────────────────────────────────────────────────
+ *  At startup (before any field is applied) the firmware samples each sensor
+ *  for CAL_SAMPLES readings and averages them. The result is stored as
+ *  zero_count[0] and zero_count[1]. All subsequent mT conversions subtract
+ *  this measured zero instead of the nominal 2048, correcting:
+ *    - Sensor quiescent output tolerance (±60 mV = ~74 LSB)
+ *    - Static ambient field (earth field ~0.03–0.06 mT)
+ *    - Any PCB-level DC magnetic bias
  *
- *  All integer math, no floats. Result in mT × 100 for 2 decimal places.
+ *  Send 'Z' at any time to re-run calibration (e.g. after moving the board).
+ *  The calibration result is reported over UART for logging.
+ *
+ *  IMPORTANT: sensors must be away from the field source during calibration.
  *
  * ── AC RMS strategy ─────────────────────────────────────────────────────────
- *  Sensors read AC magnetic fields (0–250 Hz).
- *  Output is DC-biased AC: idle at VCC/2, swings above/below for ±B.
- *  AC RMS = RMS of (sample - midscale), which is the field AC component.
- *  DC offset (midscale) cancels automatically in the subtraction.
- *
- *  RMS_SAMPLES = 512 samples per channel.
- *  At ~6 µs per dual-channel pair → ~3 ms window.
- *  Nyquist for 250 Hz = 500 Hz minimum; actual rate ~83 kHz. ✓
+ *  AC RMS = RMS of (raw - zero_count), removing the DC bias before squaring.
+ *  This correctly measures the AC field magnitude regardless of offset.
  *
  * ── Commands ────────────────────────────────────────────────────────────────
  *  'R' = single full report (instant snapshot + RMS window)
  *  'A' = toggle auto-report (~200ms interval)
  *  'S' = stream raw ADC pairs until any keypress
+ *  'Z' = re-run zero calibration
  */
 
 #include "stm32g4xx.h"
 
-/* ─── DRV5055A1 calibration (ratiometric, VCC=3.3V) ─────────────────────────
+/* ─── Sensitivity constants (ratiometric, VCC=3.3V) ─────────────────────────
  *
- * SENSITIVITY_NUM / SENSITIVITY_DEN = mT_per_count * 100  (for 2dp output)
+ * delta_mT × 100 = (raw - zero_count) * 330000 / 245760
  *
- * delta_mT × 100 = (raw - MIDSCALE) * 3300 * 100 / (4096 * 60)
- *                = (raw - MIDSCALE) * 330000 / 245760
- *
- * To keep integer math safe with 12-bit ADC:
- *   max (raw - MIDSCALE) = ±2048
- *   2048 * 330000 = 675,840,000  → fits in int32_t (max ~2.1 billion) ✓
+ * Overflow check: max |raw - zero| = ~2048
+ *   2048 * 330000 = 675,840,000 → fits in int32_t ✓
  */
-#define MIDSCALE              2048      /* ADC count at B=0 (VCC/2 ratiometric) */
-#define SENSITIVITY_NUM       330000    /* 3300 mV * 100 (for ×100 fixed-point) */
+#define SENSITIVITY_NUM       330000    /* 3300 mV * 100                        */
 #define SENSITIVITY_DEN       245760    /* 4096 counts * 60 mV/mT              */
+#define NOMINAL_MIDSCALE      2048      /* fallback if cal fails                */
+#define LINEAR_RANGE_MT_X100  2200      /* ±22.00 mT saturation threshold       */
 
-/* Clamp raw reading outside ±22mT linear range to flag saturation */
-#define LINEAR_RANGE_MT_X100  2200      /* ±22.00 mT as ×100 value             */
+/* Number of samples averaged for zero calibration (~512 at ~6us each = ~3ms) */
+#define CAL_SAMPLES           512
 
-/* RMS window depth — 512 samples per channel */
+/* RMS window depth */
 #define RMS_SAMPLES           512
+
+/* ─── Per-sensor zero offsets (set by calibrate(), used everywhere) ──────── */
+static int32_t zero_count[2] = { NOMINAL_MIDSCALE, NOMINAL_MIDSCALE };
 
 /* ─── UART ──────────────────────────────────────────────────────────────────── */
 
@@ -87,11 +87,6 @@ void uart_putn(uint32_t n) {
     while (i--) uart_putc(buf[i]);
 }
 
-void uart_putsi(int32_t n) {
-    if (n < 0) { uart_putc('-'); n = -n; }
-    uart_putn((uint32_t)n);
-}
-
 /* Print signed value as "int.frac" with 2 decimal places (val is ×100) */
 void uart_put_fixed2(int32_t val_x100) {
     if (val_x100 < 0) { uart_putc('-'); val_x100 = -val_x100; }
@@ -107,16 +102,54 @@ void uart_put_fixed2(int32_t val_x100) {
 /* Read one sample from ADC2 channel ch (2=PA1, 3=PA6). */
 static inline uint32_t adc2_read(uint32_t ch) {
     ADC2->SQR1  = (ch << 6);
-    ADC2->SMPR1 = (7U << (ch * 3));   /* max sampling time */
-    ADC2->CFGR  = 0;                  /* single, software trigger */
+    ADC2->SMPR1 = (7U << (ch * 3));
+    ADC2->CFGR  = 0;
     ADC2->CR   |= ADC_CR_ADSTART;
     while (!(ADC2->ISR & ADC_ISR_EOC));
     return ADC2->DR;
 }
 
+/* ─── Zero calibration ──────────────────────────────────────────────────────
+ *
+ * Averages CAL_SAMPLES readings for each sensor with no field applied.
+ * Stores the result in zero_count[]. Uses int64 accumulator to avoid
+ * overflow: 4095 * 512 = 2,096,640 — fine in int32, but int64 is safer
+ * if CAL_SAMPLES is ever increased.
+ */
+static void calibrate(void) {
+    uart_puts("CAL: sampling");
+
+    int64_t acc0 = 0, acc1 = 0;
+    for (int i = 0; i < CAL_SAMPLES; i++) {
+        acc0 += (int64_t)adc2_read(2);   /* PA1 = ch2 = sensor 1 */
+        acc1 += (int64_t)adc2_read(3);   /* PA6 = ch3 = sensor 2 */
+        /* Print a dot every 64 samples so the user sees activity */
+        if ((i & 63) == 63) uart_putc('.');
+    }
+
+    zero_count[0] = (int32_t)(acc0 / CAL_SAMPLES);
+    zero_count[1] = (int32_t)(acc1 / CAL_SAMPLES);
+
+    uart_puts("\r\nCAL DONE\r\n");
+    uart_puts("S1 zero_count=");
+    uart_putn((uint32_t)zero_count[0]);
+    uart_puts("  offset_mT=");
+    /* Show what offset was removed — (zero - nominal) in mT */
+    int32_t off0 = ((zero_count[0] - NOMINAL_MIDSCALE) * (int32_t)SENSITIVITY_NUM)
+                   / (int32_t)SENSITIVITY_DEN;
+    int32_t off1 = ((zero_count[1] - NOMINAL_MIDSCALE) * (int32_t)SENSITIVITY_NUM)
+                   / (int32_t)SENSITIVITY_DEN;
+    uart_put_fixed2(off0);
+    uart_puts("\r\n");
+    uart_puts("S2 zero_count=");
+    uart_putn((uint32_t)zero_count[1]);
+    uart_puts("  offset_mT=");
+    uart_put_fixed2(off1);
+    uart_puts("\r\n--------\r\n");
+}
+
 /* ─── Math ──────────────────────────────────────────────────────────────────── */
 
-/* Integer square root (Newton's method) */
 static uint32_t isqrt(uint32_t n) {
     if (n == 0) return 0;
     uint32_t x = n, y = (x + 1) / 2;
@@ -125,51 +158,37 @@ static uint32_t isqrt(uint32_t n) {
 }
 
 /*
- * Convert raw ADC count → mT × 100  (signed)
- *
- *   delta_mT×100 = (raw - MIDSCALE) * SENSITIVITY_NUM / SENSITIVITY_DEN
- *
- * Uses ratiometric cancellation: midscale = 2048 regardless of actual VCC.
+ * raw → mT × 100, zeroed against calibrated offset.
+ * sensor: 0 or 1 (indexes zero_count[]).
  */
-static int32_t raw_to_mt_x100(uint32_t raw) {
-    int32_t delta = (int32_t)raw - MIDSCALE;
+static int32_t raw_to_mt_x100(uint32_t raw, int sensor) {
+    int32_t delta = (int32_t)raw - zero_count[sensor];
     return (delta * (int32_t)SENSITIVITY_NUM) / (int32_t)SENSITIVITY_DEN;
 }
 
-/*
- * raw → millivolts (for diagnostic logging only)
- * VCC assumed 3300 mV; not ratiometrically corrected (informational).
- */
+/* raw → millivolts (diagnostic, assumes VCC=3.3V) */
 static uint32_t raw_to_mv(uint32_t raw) {
     return (raw * 3300UL) / 4096UL;
 }
 
 /*
- * AC RMS in mT × 100 for a given channel.
+ * AC RMS in mT × 100 for a given channel, zeroed against calibrated offset.
+ * sensor: 0 or 1.
  *
- * Computes RMS of (raw - MIDSCALE) over RMS_SAMPLES, then converts to mT.
- *
- * Overflow check for uint64_t accumulator:
- *   max |delta| = 2048 (full-scale)
- *   delta^2     = 4,194,304
- *   × 512       = 2,147,483,648  → fits in uint64_t easily ✓
- *
- * Returns magnitude (always ≥ 0).
+ * Overflow: max |delta| after cal still ≤ ~2048 in practice (±22mT range),
+ * delta^2 ≤ 4,194,304, × 512 = 2,147,483,648 → fits in uint64_t easily ✓
  */
-static uint32_t ac_rms_mt_x100(uint32_t ch) {
+static uint32_t ac_rms_mt_x100(uint32_t ch, int sensor) {
     uint64_t sum_sq = 0;
     for (int i = 0; i < RMS_SAMPLES; i++) {
-        int32_t delta = (int32_t)adc2_read(ch) - MIDSCALE;
+        int32_t delta = (int32_t)adc2_read(ch) - zero_count[sensor];
         sum_sq += (uint64_t)((int64_t)delta * delta);
     }
     uint32_t rms_counts = isqrt((uint32_t)(sum_sq / RMS_SAMPLES));
-    /* rms_counts is always positive; apply sensitivity directly */
     return (rms_counts * (uint32_t)SENSITIVITY_NUM) / (uint32_t)SENSITIVITY_DEN;
 }
 
-/*
- * Also compute RMS of raw counts (for diagnostic output).
- */
+/* RMS of raw counts (diagnostic) */
 static uint32_t rms_raw(uint32_t ch) {
     uint64_t sum_sq = 0;
     for (int i = 0; i < RMS_SAMPLES; i++) {
@@ -183,9 +202,7 @@ static uint32_t rms_raw(uint32_t ch) {
 
 static void print_sat_warning(int32_t mt_x100) {
     int32_t abs_mt = mt_x100 < 0 ? -mt_x100 : mt_x100;
-    if (abs_mt > LINEAR_RANGE_MT_X100) {
-        uart_puts(" SAT!");
-    }
+    if (abs_mt > LINEAR_RANGE_MT_X100) uart_puts(" SAT!");
 }
 
 /* ─── Report ────────────────────────────────────────────────────────────────── */
@@ -198,58 +215,42 @@ void do_full_report(void) {
     uint32_t mv1  = raw_to_mv(raw1);
     uint32_t mv2  = raw_to_mv(raw2);
 
-    int32_t  mt1  = raw_to_mt_x100(raw1);
-    int32_t  mt2  = raw_to_mt_x100(raw2);
+    int32_t  mt1  = raw_to_mt_x100(raw1, 0);
+    int32_t  mt2  = raw_to_mt_x100(raw2, 1);
 
     /* ── RMS window ───────────────────────────────────── */
-    uint32_t rms1_raw   = rms_raw(2);
-    uint32_t rms2_raw   = rms_raw(3);
-
-    uint32_t rms1_mt    = ac_rms_mt_x100(2);
-    uint32_t rms2_mt    = ac_rms_mt_x100(3);
-
-    uint32_t rms1_mv    = raw_to_mv(rms1_raw);
-    uint32_t rms2_mv    = raw_to_mv(rms2_raw);
+    uint32_t rms1_raw = rms_raw(2);
+    uint32_t rms2_raw = rms_raw(3);
+    uint32_t rms1_mv  = raw_to_mv(rms1_raw);
+    uint32_t rms2_mv  = raw_to_mv(rms2_raw);
+    uint32_t rms1_mt  = ac_rms_mt_x100(2, 0);
+    uint32_t rms2_mt  = ac_rms_mt_x100(3, 1);
 
     /* ── Print ────────────────────────────────────────── */
     uart_puts("=== INSTANT ===\r\n");
 
-    uart_puts("S1(PA1): RAW=");
-    uart_putn(raw1);
-    uart_puts("  mV=");
-    uart_putn(mv1);
-    uart_puts("  mT=");
-    uart_put_fixed2(mt1);
-    print_sat_warning(mt1);
-    uart_puts("\r\n");
+    uart_puts("S1(PA1): RAW=");  uart_putn(raw1);
+    uart_puts("  mV=");          uart_putn(mv1);
+    uart_puts("  mT=");          uart_put_fixed2(mt1);
+    print_sat_warning(mt1);      uart_puts("\r\n");
 
-    uart_puts("S2(PA6): RAW=");
-    uart_putn(raw2);
-    uart_puts("  mV=");
-    uart_putn(mv2);
-    uart_puts("  mT=");
-    uart_put_fixed2(mt2);
-    print_sat_warning(mt2);
-    uart_puts("\r\n");
+    uart_puts("S2(PA6): RAW=");  uart_putn(raw2);
+    uart_puts("  mV=");          uart_putn(mv2);
+    uart_puts("  mT=");          uart_put_fixed2(mt2);
+    print_sat_warning(mt2);      uart_puts("\r\n");
 
     uart_puts("=== RMS (");
     uart_putn(RMS_SAMPLES);
-    uart_puts(" samples, AC only) ===\r\n");
+    uart_puts(" samples, AC, zeroed) ===\r\n");
 
-    uart_puts("S1(PA1): RMS_RAW=");
-    uart_putn(rms1_raw);
-    uart_puts("  RMS_mV=");
-    uart_putn(rms1_mv);
-    uart_puts("  AC_RMS_mT=");
-    uart_put_fixed2((int32_t)rms1_mt);
+    uart_puts("S1(PA1): RMS_RAW="); uart_putn(rms1_raw);
+    uart_puts("  RMS_mV=");         uart_putn(rms1_mv);
+    uart_puts("  AC_RMS_mT=");      uart_put_fixed2((int32_t)rms1_mt);
     uart_puts("\r\n");
 
-    uart_puts("S2(PA6): RMS_RAW=");
-    uart_putn(rms2_raw);
-    uart_puts("  RMS_mV=");
-    uart_putn(rms2_mv);
-    uart_puts("  AC_RMS_mT=");
-    uart_put_fixed2((int32_t)rms2_mt);
+    uart_puts("S2(PA6): RMS_RAW="); uart_putn(rms2_raw);
+    uart_puts("  RMS_mV=");         uart_putn(rms2_mv);
+    uart_puts("  AC_RMS_mT=");      uart_put_fixed2((int32_t)rms2_mt);
     uart_puts("\r\n");
 
     uart_puts("--------\r\n");
@@ -265,10 +266,8 @@ void do_stream(void) {
         }
         uint32_t s1 = adc2_read(2);
         uint32_t s2 = adc2_read(3);
-        uart_puts("S1=");
-        uart_putn(s1);
-        uart_puts(" S2=");
-        uart_putn(s2);
+        uart_puts("S1="); uart_putn(s1);
+        uart_puts(" S2="); uart_putn(s2);
         uart_puts("\r\n");
     }
     uart_puts("STREAM STOP\r\n");
@@ -277,7 +276,7 @@ void do_stream(void) {
 /* ─── Main ──────────────────────────────────────────────────────────────────── */
 
 int main(void) {
-    /* 1. Clock — raw registers, always first (see project notes) */
+    /* 1. Clock */
     RCC->CR |= RCC_CR_HSION;
     while (!(RCC->CR & RCC_CR_HSIRDY));
     RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_HSI;
@@ -295,22 +294,22 @@ int main(void) {
     GPIOA->AFR[0] |=  ((7U   << (2*4)) | (7U   << (3*4)));
 
     /* 4. PA1 = analog (ADC2_IN2), PA6 = analog (ADC2_IN3) */
-    GPIOA->MODER |= (3U << (1*2));    /* PA1 → analog */
-    GPIOA->MODER |= (3U << (6*2));    /* PA6 → analog */
+    GPIOA->MODER |= (3U << (1*2));
+    GPIOA->MODER |= (3U << (6*2));
 
-    /* 5. USART2: 9600 baud at 16MHz (16000000/9600 = 1666.7 → 1667) */
+    /* 5. USART2: 9600 baud at 16MHz */
     USART2->BRR = 1667;
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 
-    /* 6. ADC2 clock = SYSCLK (CCIPR ADC12SEL[1:0] = 10) */
+    /* 6. ADC2 clock = SYSCLK */
     RCC->CCIPR |= RCC_CCIPR_ADC12SEL_1;
 
-    /* 7. ADC voltage regulator startup */
+    /* 7. ADC voltage regulator */
     ADC2->CR = 0;
     ADC2->CR |= ADC_CR_ADVREGEN;
-    for (volatile int i = 0; i < 10000; i++);    /* ~20us settle */
+    for (volatile int i = 0; i < 10000; i++);
 
-    /* 8. Calibrate ADC2 (single-ended, ADCALDIF=0) */
+    /* 8. Calibrate ADC2 */
     ADC2->CR |= ADC_CR_ADCAL;
     while (ADC2->CR & ADC_CR_ADCAL);
 
@@ -319,11 +318,13 @@ int main(void) {
     while (!(ADC2->ISR & ADC_ISR_ADRDY));
 
     uart_puts("BOOT OK\r\n");
-    uart_puts("DRV5055A1 dual sensor firmware\r\n");
-    uart_puts("Sensitivity: 60mV/mT @ 3.3V | Midscale: 1.65V | Range: +/-22mT\r\n");
-    uart_puts("Ratiometric: VCC variation cancels in ADC ratio\r\n");
-    uart_puts("R=report  A=auto-report  S=stream raw\r\n");
+    uart_puts("DRV5055A1 dual sensor | 60mV/mT | range +/-22mT\r\n");
+    uart_puts("R=report  A=auto  S=stream  Z=recalibrate\r\n");
     uart_puts("--------\r\n");
+
+    /* Run zero calibration at boot — ensure no field present */
+    uart_puts("Boot calibration (remove field sources now)...\r\n");
+    calibrate();
 
     uint8_t auto_mode = 0;
 
@@ -334,11 +335,11 @@ int main(void) {
             else if (c == 'A') { auto_mode = !auto_mode;
                                  uart_puts(auto_mode ? "AUTO ON\r\n" : "AUTO OFF\r\n"); }
             else if (c == 'S') { do_stream(); }
+            else if (c == 'Z') { calibrate(); }
         }
 
         if (auto_mode) {
             do_full_report();
-            /* ~200ms delay at 16MHz */
             for (volatile uint32_t d = 0; d < 3200000UL; d++);
         }
     }

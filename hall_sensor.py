@@ -299,7 +299,7 @@ def mode_interactive(ser):
     """Simple interactive terminal for manual commands."""
     flush_boot_messages(ser)
     print(f"Connected to {PORT} at {BAUD} baud.")
-    print("Commands:  R = report   A = toggle auto   S = stream raw   Q = quit")
+    print("Commands:  R = report   A = toggle auto   S = stream raw   Z = recalibrate   Q = quit")
     print("-" * 60)
 
     # Print any pending boot banner
@@ -320,8 +320,8 @@ def mode_interactive(ser):
             continue
         if cmd == "Q":
             break
-        if cmd not in ("R", "A", "S"):
-            print("Unknown command. Use R, A, S, or Q.")
+        if cmd not in ("R", "A", "S", "Z"):
+            print("Unknown command. Use R, A, S, Z, or Q.")
             continue
 
         ser.write(cmd.encode())
@@ -337,7 +337,7 @@ def mode_interactive(ser):
         elif cmd == "A":
             # Read and print lines until user presses Enter
             print("Auto mode (press Enter to stop)...")
-            import threading, select
+            import threading
             stop = threading.Event()
             def reader():
                 while not stop.is_set():
@@ -353,6 +353,12 @@ def mode_interactive(ser):
             t.join(timeout=2)
         elif cmd == "S":
             mode_stream(ser, already_started=True)
+        elif cmd == "Z":
+            print("Recalibrating -- ensure no field sources are active...")
+            # Cal output ends with '--------', use read_report_lines to capture it
+            lines = read_report_lines(ser, timeout=10.0)
+            for l in lines:
+                print(f"  {l}")
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────────
