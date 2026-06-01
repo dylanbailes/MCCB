@@ -239,18 +239,26 @@ def mode_auto(ser, log=False):
             print(f"[LOG] Saved to {csv_name}")
 
 
-def mode_stream(ser):
+def mode_stream(ser, already_started=False):
     """
     Send 'S' to start raw ADC streaming.
     Prints S1/S2 raw counts as fast as they arrive.
-    Any keypress (Enter in terminal) stops it — or Ctrl+C.
+    Ctrl+C to stop.
+
+    already_started: True when called from mode_interactive, which already
+                     wrote 'S' before calling this, so we don't send it again
+                     or flush the buffer (which would discard the first lines).
     """
-    flush_boot_messages(ser)
     print("Raw ADC stream mode. Press Ctrl+C to stop.")
     print(f"{'#':>6}  {'S1_RAW':>7}  {'S2_RAW':>7}  {'S1_mT':>8}  {'S2_mT':>8}")
     print("-" * 50)
 
-    ser.write(b'S')
+    if not already_started:
+        flush_boot_messages(ser)
+        ser.write(b'S')
+
+    time.sleep(0.05)          # let firmware start sending before we read
+    ser.timeout = 1.0         # tighter than default 2s so readline doesn't stall
     count = 0
 
     # DRV5055A1 conversion constants (mirror firmware)
@@ -344,7 +352,7 @@ def mode_interactive(ser):
             ser.write(b'A')   # toggle off
             t.join(timeout=2)
         elif cmd == "S":
-            mode_stream(ser)
+            mode_stream(ser, already_started=True)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────────
