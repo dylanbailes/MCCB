@@ -102,27 +102,32 @@ def parse_report(lines):
         return m.group(1) if m else None
 
     for line in lines:
-        if line.startswith("S1(PA1):") and "RAW=" in line and "RMS" not in line:
+        if line.startswith("VBUS="):
+            data["vbus_v"]   = extract(line, "VBUS")
+            data["vbus_raw"] = extract(line, "VBUS_RAW")
+
+        elif line.startswith("ISENSE="):
+            data["isense_a"]   = extract(line, "ISENSE")
+            data["isense_raw"] = extract(line, "ISENSE_RAW")
+            data["isense_warn"] = "***" in line
+
+        elif line.startswith("S1(PA1):") and "RAW=" in line and "RMS" not in line:
             data["s1_raw"] = extract(line, "RAW")
-            data["s1_mv"]  = extract(line, "mV")
             data["s1_mt"]  = extract(line, "mT")
             data["s1_sat"] = "SAT" in line
 
         elif line.startswith("S2(PA6):") and "RAW=" in line and "RMS" not in line:
             data["s2_raw"] = extract(line, "RAW")
-            data["s2_mv"]  = extract(line, "mV")
             data["s2_mt"]  = extract(line, "mT")
             data["s2_sat"] = "SAT" in line
 
         elif line.startswith("S1(PA1):") and "RMS_RAW=" in line:
-            data["s1_rms_raw"]    = extract(line, "RMS_RAW")
-            data["s1_rms_mv"]     = extract(line, "RMS_mV")
-            data["s1_ac_rms_mt"]  = extract(line, "AC_RMS_mT")
+            data["s1_rms_raw"]   = extract(line, "RMS_RAW")
+            data["s1_ac_rms_mt"] = extract(line, "AC_RMS_mT")
 
         elif line.startswith("S2(PA6):") and "RMS_RAW=" in line:
-            data["s2_rms_raw"]    = extract(line, "RMS_RAW")
-            data["s2_rms_mv"]     = extract(line, "RMS_mV")
-            data["s2_ac_rms_mt"]  = extract(line, "AC_RMS_mT")
+            data["s2_rms_raw"]   = extract(line, "RMS_RAW")
+            data["s2_ac_rms_mt"] = extract(line, "AC_RMS_mT")
 
     # Require at least the instant values to be present
     if not all(k in data for k in ("s1_raw", "s2_raw")):
@@ -137,30 +142,29 @@ def print_report(data, timestamp=None):
     sat2 = " ⚠ SATURATED" if data.get("s2_sat") else ""
 
     print(f"\n[{ts}]")
+    vwarn = "  ⚠ CHECK" if not data.get("vbus_v") or float(data.get("vbus_v","0") or 0) < 1.0 else ""
+    iwarn = "  ⚠ >100mA" if data.get("isense_warn") else ""
+    print(f"  ── Power ──────────────────────────────────────")
+    print(f"  VBUS:      {data.get('vbus_v','?'):>7} V   RAW={data.get('vbus_raw','?'):>4}{vwarn}")
+    print(f"  Current:   {data.get('isense_a','?'):>7} A   RAW={data.get('isense_raw','?'):>4}{iwarn}")
     print(f"  ── Instantaneous ──────────────────────────────")
-    print(f"  S1 (PA1):  RAW={data.get('s1_raw','?'):>4}  "
-          f"mV={data.get('s1_mv','?'):>4}  "
-          f"mT={data.get('s1_mt','?'):>7}{sat1}")
-    print(f"  S2 (PA6):  RAW={data.get('s2_raw','?'):>4}  "
-          f"mV={data.get('s2_mv','?'):>4}  "
-          f"mT={data.get('s2_mt','?'):>7}{sat2}")
+    print(f"  S1 (PA1):  RAW={data.get('s1_raw','?'):>4}  mT={data.get('s1_mt','?'):>7}{sat1}")
+    print(f"  S2 (PA6):  RAW={data.get('s2_raw','?'):>4}  mT={data.get('s2_mt','?'):>7}{sat2}")
     print(f"  ── AC RMS (512 samples) ───────────────────────")
-    print(f"  S1 (PA1):  RMS_RAW={data.get('s1_rms_raw','?'):>4}  "
-          f"RMS_mV={data.get('s1_rms_mv','?'):>4}  "
-          f"AC_RMS_mT={data.get('s1_ac_rms_mt','?'):>7}")
-    print(f"  S2 (PA6):  RMS_RAW={data.get('s2_rms_raw','?'):>4}  "
-          f"RMS_mV={data.get('s2_rms_mv','?'):>4}  "
-          f"AC_RMS_mT={data.get('s2_ac_rms_mt','?'):>7}")
+    print(f"  S1 (PA1):  RMS_RAW={data.get('s1_rms_raw','?'):>4}  AC_RMS_mT={data.get('s1_ac_rms_mt','?'):>7}")
+    print(f"  S2 (PA6):  RMS_RAW={data.get('s2_rms_raw','?'):>4}  AC_RMS_mT={data.get('s2_ac_rms_mt','?'):>7}")
 
 
 # ── CSV logging ──────────────────────────────────────────────────────────────────
 
 CSV_FIELDS = [
     "timestamp",
-    "s1_raw", "s1_mv", "s1_mt", "s1_sat",
-    "s2_raw", "s2_mv", "s2_mt", "s2_sat",
-    "s1_rms_raw", "s1_rms_mv", "s1_ac_rms_mt",
-    "s2_rms_raw", "s2_rms_mv", "s2_ac_rms_mt",
+    "vbus_v", "vbus_raw",
+    "isense_a", "isense_raw",
+    "s1_raw", "s1_mt", "s1_sat",
+    "s2_raw", "s2_mt", "s2_sat",
+    "s1_rms_raw", "s1_ac_rms_mt",
+    "s2_rms_raw", "s2_ac_rms_mt",
 ]
 
 def open_csv():
@@ -299,7 +303,7 @@ def mode_interactive(ser):
     """Simple interactive terminal for manual commands."""
     flush_boot_messages(ser)
     print(f"Connected to {PORT} at {BAUD} baud.")
-    print("Commands:  R = report   A = toggle auto   S = stream raw   Z = recalibrate   Q = quit")
+    print("Commands:  R=report  A=auto  S=stream  Z=recalibrate  F=forward  B=brake  C=coast  +=duty+  -=duty-  P=pwm state  Q=quit")
     print("-" * 60)
 
     # Print any pending boot banner
@@ -320,8 +324,8 @@ def mode_interactive(ser):
             continue
         if cmd == "Q":
             break
-        if cmd not in ("R", "A", "S", "Z"):
-            print("Unknown command. Use R, A, S, Z, or Q.")
+        if cmd not in ("R", "A", "S", "Z", "F", "B", "C", "P", "+", "-"):
+            print("Unknown command. Use R, A, S, Z, F, R, B, C, +, -, P, or Q.")
             continue
 
         ser.write(cmd.encode())
