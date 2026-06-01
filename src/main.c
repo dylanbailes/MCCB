@@ -1,74 +1,61 @@
 /*
- * main.c - Dual DRV5055A1EDBZRQ1 Hall Sensor RMS Firmware
- * STM32G431CBU6 | Raw registers only (no HAL) | 16MHz HSI
+ * pwm_test.c - TIM1 PWM test on PA8 (IN1) and PA9 (IN2)
+ * STM32G431CBU6 | Raw registers | 16MHz HSI
  *
- * Sensors: Texas Instruments DRV5055A1EDBZRQ1
- *   PA1 = ADC2_IN2  (Sensor 1)
- *   PA6 = ADC2_IN3  (Sensor 2)
+ * DRV8874PWPR connections:
+ *   PA8  → IN1  (TIM1_CH1, AF6)
+ *   PA9  → IN2  (TIM1_CH2, AF6)
+ *   3.3V → DVDD, nSLEEP (tie high to wake chip)
+ *   GND  → GND
+ *   PVDD → leave disconnected for logic-only test
  *
- * UART: PA2=TX, PA3=RX, 9600 baud → Raspberry Pi 5
+ * DRV8874 PH/EN vs IN/IN mode:
+ *   The DRV8874 supports two control modes selected by the PHEN pin.
+ *   PHEN low  = IN/IN mode: IN1 and IN2 independently control each half-bridge.
+ *   PHEN high = PH/EN mode: IN1=direction, IN2=PWM enable.
+ *   This firmware uses IN/IN mode (tie PHEN to GND).
  *
- * ── DRV5055A1 specs at VCC = 3.3V ───────────────────────────────────────────
- *  Sensitivity:       60 mV/mT (typ), range 57–63 mV/mT
- *  Quiescent voltage: VCC/2 = 1.65V (1.59–1.71V tolerance)
- *  Linear range:      ±22 mT
- *  Bandwidth:         20 kHz
+ *   IN/IN truth table:
+ *     IN1=0, IN2=0 → Coast (Hi-Z)
+ *     IN1=1, IN2=0 → Forward
+ *     IN1=0, IN2=1 → Reverse
+ *     IN1=1, IN2=1 → Brake
  *
- * ── Ratiometric note ────────────────────────────────────────────────────────
- *  The DRV5055 output and quiescent point both scale with VCC.
- *  Since the STM32 ADC reference is also VCC, the ratio cancels supply
- *  variation. Nominal midscale = 2048 counts. After boot calibration the
- *  per-sensor zero_count replaces 2048 for all conversions.
+ * PWM strategy for IN/IN mode:
+ *   Forward at N% duty: IN1 = N% PWM, IN2 = 0 (constant low)
+ *   Reverse at N% duty: IN1 = 0,       IN2 = N% PWM
+ *   Brake:              IN1 = 1,        IN2 = 1
+ *   Coast:              IN1 = 0,        IN2 = 0
  *
- * ── Zero-offset calibration ─────────────────────────────────────────────────
- *  At startup (before any field is applied) the firmware samples each sensor
- *  for CAL_SAMPLES readings and averages them. The result is stored as
- *  zero_count[0] and zero_count[1]. All subsequent mT conversions subtract
- *  this measured zero instead of the nominal 2048, correcting:
- *    - Sensor quiescent output tolerance (±60 mV = ~74 LSB)
- *    - Static ambient field (earth field ~0.03–0.06 mT)
- *    - Any PCB-level DC magnetic bias
+ * Timer config:
+ *   TIM1 on APB2, clock = 16MHz HSI (no PLL)
+ *   Period = 1000 counts → 16kHz PWM (16MHz / 1000)
+ *   CCR1/CCR2 = 0–1000 = 0–100% duty cycle
  *
- *  Send 'Z' at any time to re-run calibration (e.g. after moving the board).
- *  The calibration result is reported over UART for logging.
+ * Commands (UART, same port as sensor firmware):
+ *   'F' = Forward 50% (IN1 PWM, IN2 low)
+ *   'R' = Reverse 50% (IN1 low, IN2 PWM)
+ *   'B' = Brake (IN1 high, IN2 high)
+ *   'C' = Coast (IN1 low, IN2 low)
+ *   '+' = Increase duty 10%
+ *   '-' = Decrease duty 10%
+ *   'P' = Print current state
  *
- *  IMPORTANT: sensors must be away from the field source during calibration.
- *
- * ── AC RMS strategy ─────────────────────────────────────────────────────────
- *  AC RMS = RMS of (raw - zero_count), removing the DC bias before squaring.
- *  This correctly measures the AC field magnitude regardless of offset.
- *
- * ── Commands ────────────────────────────────────────────────────────────────
- *  'R' = single full report (instant snapshot + RMS window)
- *  'A' = toggle auto-report (~200ms interval)
- *  'S' = stream raw ADC pairs until any keypress
- *  'Z' = re-run zero calibration
+ * Verification without 24V:
+ *   Multimeter on PA8/PA9: forward → PA8 ~1.65V avg (50% of 3.3V), PA9 = 0V
+ *   Oscilloscope preferred: should show clean 16kHz square wave
+ *   DRV8874 nFAULT pin will float/high with no PVDD — that's normal
  */
 
 #include "stm32g4xx.h"
 
-/* ─── Sensitivity constants (ratiometric, VCC=3.3V) ─────────────────────────
- *
- * delta_mT × 100 = (raw - zero_count) * 330000 / 245760
- *
- * Overflow check: max |raw - zero| = ~2048
- *   2048 * 330000 = 675,840,000 → fits in int32_t ✓
- */
-#define SENSITIVITY_NUM       330000    /* 3300 mV * 100                        */
-#define SENSITIVITY_DEN       245760    /* 4096 counts * 60 mV/mT              */
-#define NOMINAL_MIDSCALE      2048      /* fallback if cal fails                */
-#define LINEAR_RANGE_MT_X100  2200      /* ±22.00 mT saturation threshold       */
+/* ─── PWM config ─────────────────────────────────────────────────────────────── */
+#define PWM_PERIOD      1000    /* ARR value: 16MHz/1000 = 16kHz                 */
+#define PWM_DUTY_STEP   100     /* 10% per +/- press (100/1000 = 10%)            */
+#define PWM_DUTY_MAX    1000
+#define PWM_DUTY_MIN    0
 
-/* Number of samples averaged for zero calibration (~512 at ~6us each = ~3ms) */
-#define CAL_SAMPLES           512
-
-/* RMS window depth */
-#define RMS_SAMPLES           512
-
-/* ─── Per-sensor zero offsets (set by calibrate(), used everywhere) ──────── */
-static int32_t zero_count[2] = { NOMINAL_MIDSCALE, NOMINAL_MIDSCALE };
-
-/* ─── UART ──────────────────────────────────────────────────────────────────── */
+/* ─── UART (same as sensor firmware) ────────────────────────────────────────── */
 
 void uart_putc(char c) {
     while (!(USART2->ISR & USART_ISR_TXE));
@@ -87,193 +74,73 @@ void uart_putn(uint32_t n) {
     while (i--) uart_putc(buf[i]);
 }
 
-/* Print signed value as "int.frac" with 2 decimal places (val is ×100) */
-void uart_put_fixed2(int32_t val_x100) {
-    if (val_x100 < 0) { uart_putc('-'); val_x100 = -val_x100; }
-    uart_putn((uint32_t)(val_x100 / 100));
-    uart_putc('.');
-    uint32_t frac = (uint32_t)(val_x100 % 100);
-    if (frac < 10) uart_putc('0');
-    uart_putn(frac);
-}
+/* ─── PWM state ──────────────────────────────────────────────────────────────── */
 
-/* ─── ADC ───────────────────────────────────────────────────────────────────── */
+typedef enum { COAST, FORWARD, REVERSE, BRAKE } DriveMode;
 
-/* Read one sample from ADC2 channel ch (2=PA1, 3=PA6). */
-static inline uint32_t adc2_read(uint32_t ch) {
-    ADC2->SQR1  = (ch << 6);
-    ADC2->SMPR1 = (7U << (ch * 3));
-    ADC2->CFGR  = 0;
-    ADC2->CR   |= ADC_CR_ADSTART;
-    while (!(ADC2->ISR & ADC_ISR_EOC));
-    return ADC2->DR;
-}
-
-/* ─── Zero calibration ──────────────────────────────────────────────────────
- *
- * Averages CAL_SAMPLES readings for each sensor with no field applied.
- * Stores the result in zero_count[]. Uses int64 accumulator to avoid
- * overflow: 4095 * 512 = 2,096,640 — fine in int32, but int64 is safer
- * if CAL_SAMPLES is ever increased.
- */
-static void calibrate(void) {
-    uart_puts("CAL: sampling");
-
-    int64_t acc0 = 0, acc1 = 0;
-    for (int i = 0; i < CAL_SAMPLES; i++) {
-        acc0 += (int64_t)adc2_read(2);   /* PA1 = ch2 = sensor 1 */
-        acc1 += (int64_t)adc2_read(3);   /* PA6 = ch3 = sensor 2 */
-        /* Print a dot every 64 samples so the user sees activity */
-        if ((i & 63) == 63) uart_putc('.');
-    }
-
-    zero_count[0] = (int32_t)(acc0 / CAL_SAMPLES);
-    zero_count[1] = (int32_t)(acc1 / CAL_SAMPLES);
-
-    uart_puts("\r\nCAL DONE\r\n");
-    uart_puts("S1 zero_count=");
-    uart_putn((uint32_t)zero_count[0]);
-    uart_puts("  offset_mT=");
-    /* Show what offset was removed — (zero - nominal) in mT */
-    int32_t off0 = ((zero_count[0] - NOMINAL_MIDSCALE) * (int32_t)SENSITIVITY_NUM)
-                   / (int32_t)SENSITIVITY_DEN;
-    int32_t off1 = ((zero_count[1] - NOMINAL_MIDSCALE) * (int32_t)SENSITIVITY_NUM)
-                   / (int32_t)SENSITIVITY_DEN;
-    uart_put_fixed2(off0);
-    uart_puts("\r\n");
-    uart_puts("S2 zero_count=");
-    uart_putn((uint32_t)zero_count[1]);
-    uart_puts("  offset_mT=");
-    uart_put_fixed2(off1);
-    uart_puts("\r\n--------\r\n");
-}
-
-/* ─── Math ──────────────────────────────────────────────────────────────────── */
-
-static uint32_t isqrt(uint32_t n) {
-    if (n == 0) return 0;
-    uint32_t x = n, y = (x + 1) / 2;
-    while (y < x) { x = y; y = (x + n / x) / 2; }
-    return x;
-}
+static DriveMode current_mode = COAST;
+static uint32_t  duty         = 500;   /* start at 50% */
 
 /*
- * raw → mT × 100, zeroed against calibrated offset.
- * sensor: 0 or 1 (indexes zero_count[]).
- */
-static int32_t raw_to_mt_x100(uint32_t raw, int sensor) {
-    int32_t delta = (int32_t)raw - zero_count[sensor];
-    return (delta * (int32_t)SENSITIVITY_NUM) / (int32_t)SENSITIVITY_DEN;
-}
-
-/* raw → millivolts (diagnostic, assumes VCC=3.3V) */
-static uint32_t raw_to_mv(uint32_t raw) {
-    return (raw * 3300UL) / 4096UL;
-}
-
-/*
- * AC RMS in mT × 100 for a given channel, zeroed against calibrated offset.
- * sensor: 0 or 1.
+ * Apply current mode and duty to TIM1 CCR1/CCR2.
  *
- * Overflow: max |delta| after cal still ≤ ~2048 in practice (±22mT range),
- * delta^2 ≤ 4,194,304, × 512 = 2,147,483,648 → fits in uint64_t easily ✓
+ * TIM1 CH1 = PA8 = IN1
+ * TIM1 CH2 = PA9 = IN2
+ *
+ * CCRx = 0         → pin stays low  (0% duty)
+ * CCRx = PWM_PERIOD → pin stays high (100% duty)
+ * CCRx = N          → N/PWM_PERIOD duty cycle
+ *
+ * PWM mode 1: output high while CNT < CCR, low otherwise.
  */
-static uint32_t ac_rms_mt_x100(uint32_t ch, int sensor) {
-    uint64_t sum_sq = 0;
-    for (int i = 0; i < RMS_SAMPLES; i++) {
-        int32_t delta = (int32_t)adc2_read(ch) - zero_count[sensor];
-        sum_sq += (uint64_t)((int64_t)delta * delta);
-    }
-    uint32_t rms_counts = isqrt((uint32_t)(sum_sq / RMS_SAMPLES));
-    return (rms_counts * (uint32_t)SENSITIVITY_NUM) / (uint32_t)SENSITIVITY_DEN;
-}
-
-/* RMS of raw counts (diagnostic) */
-static uint32_t rms_raw(uint32_t ch) {
-    uint64_t sum_sq = 0;
-    for (int i = 0; i < RMS_SAMPLES; i++) {
-        uint32_t s = adc2_read(ch);
-        sum_sq += (uint64_t)s * s;
-    }
-    return isqrt((uint32_t)(sum_sq / RMS_SAMPLES));
-}
-
-/* ─── Saturation check ──────────────────────────────────────────────────────── */
-
-static void print_sat_warning(int32_t mt_x100) {
-    int32_t abs_mt = mt_x100 < 0 ? -mt_x100 : mt_x100;
-    if (abs_mt > LINEAR_RANGE_MT_X100) uart_puts(" SAT!");
-}
-
-/* ─── Report ────────────────────────────────────────────────────────────────── */
-
-void do_full_report(void) {
-    /* ── Instantaneous snapshot ───────────────────────── */
-    uint32_t raw1 = adc2_read(2);
-    uint32_t raw2 = adc2_read(3);
-
-    uint32_t mv1  = raw_to_mv(raw1);
-    uint32_t mv2  = raw_to_mv(raw2);
-
-    int32_t  mt1  = raw_to_mt_x100(raw1, 0);
-    int32_t  mt2  = raw_to_mt_x100(raw2, 1);
-
-    /* ── RMS window ───────────────────────────────────── */
-    uint32_t rms1_raw = rms_raw(2);
-    uint32_t rms2_raw = rms_raw(3);
-    uint32_t rms1_mv  = raw_to_mv(rms1_raw);
-    uint32_t rms2_mv  = raw_to_mv(rms2_raw);
-    uint32_t rms1_mt  = ac_rms_mt_x100(2, 0);
-    uint32_t rms2_mt  = ac_rms_mt_x100(3, 1);
-
-    /* ── Print ────────────────────────────────────────── */
-    uart_puts("=== INSTANT ===\r\n");
-
-    uart_puts("S1(PA1): RAW=");  uart_putn(raw1);
-    uart_puts("  mV=");          uart_putn(mv1);
-    uart_puts("  mT=");          uart_put_fixed2(mt1);
-    print_sat_warning(mt1);      uart_puts("\r\n");
-
-    uart_puts("S2(PA6): RAW=");  uart_putn(raw2);
-    uart_puts("  mV=");          uart_putn(mv2);
-    uart_puts("  mT=");          uart_put_fixed2(mt2);
-    print_sat_warning(mt2);      uart_puts("\r\n");
-
-    uart_puts("=== RMS (");
-    uart_putn(RMS_SAMPLES);
-    uart_puts(" samples, AC, zeroed) ===\r\n");
-
-    uart_puts("S1(PA1): RMS_RAW="); uart_putn(rms1_raw);
-    uart_puts("  RMS_mV=");         uart_putn(rms1_mv);
-    uart_puts("  AC_RMS_mT=");      uart_put_fixed2((int32_t)rms1_mt);
-    uart_puts("\r\n");
-
-    uart_puts("S2(PA6): RMS_RAW="); uart_putn(rms2_raw);
-    uart_puts("  RMS_mV=");         uart_putn(rms2_mv);
-    uart_puts("  AC_RMS_mT=");      uart_put_fixed2((int32_t)rms2_mt);
-    uart_puts("\r\n");
-
-    uart_puts("--------\r\n");
-}
-
-/* Stream raw pairs — stops on any incoming byte */
-void do_stream(void) {
-    uart_puts("STREAM START (any key to stop)\r\n");
-    while (1) {
-        if (USART2->ISR & USART_ISR_RXNE) {
-            (void)USART2->RDR;
+static void pwm_apply(void) {
+    switch (current_mode) {
+        case FORWARD:
+            /* IN1 = PWM, IN2 = 0 */
+            TIM1->CCR1 = duty;
+            TIM1->CCR2 = 0;
             break;
-        }
-        uint32_t s1 = adc2_read(2);
-        uint32_t s2 = adc2_read(3);
-        uart_puts("S1="); uart_putn(s1);
-        uart_puts(" S2="); uart_putn(s2);
-        uart_puts("\r\n");
+        case REVERSE:
+            /* IN1 = 0, IN2 = PWM */
+            TIM1->CCR1 = 0;
+            TIM1->CCR2 = duty;
+            break;
+        case BRAKE:
+            /* IN1 = 1, IN2 = 1 — force both high via CCR = period */
+            TIM1->CCR1 = PWM_PERIOD;
+            TIM1->CCR2 = PWM_PERIOD;
+            break;
+        case COAST:
+        default:
+            /* IN1 = 0, IN2 = 0 */
+            TIM1->CCR1 = 0;
+            TIM1->CCR2 = 0;
+            break;
     }
-    uart_puts("STREAM STOP\r\n");
+    /* Trigger update to load shadow registers immediately */
+    TIM1->EGR = TIM_EGR_UG;
 }
 
-/* ─── Main ──────────────────────────────────────────────────────────────────── */
+static void print_state(void) {
+    const char *mode_str;
+    switch (current_mode) {
+        case FORWARD: mode_str = "FORWARD"; break;
+        case REVERSE: mode_str = "REVERSE"; break;
+        case BRAKE:   mode_str = "BRAKE";   break;
+        default:      mode_str = "COAST";   break;
+    }
+    uart_puts("Mode=");
+    uart_puts(mode_str);
+    uart_puts("  Duty=");
+    uart_putn(duty * 100 / PWM_PERIOD);
+    uart_puts("%  CCR1=");
+    uart_putn(TIM1->CCR1);
+    uart_puts("  CCR2=");
+    uart_putn(TIM1->CCR2);
+    uart_puts("\r\n");
+}
+
+/* ─── Main ───────────────────────────────────────────────────────────────────── */
 
 int main(void) {
     /* 1. Clock */
@@ -285,62 +152,117 @@ int main(void) {
     /* 2. Peripheral clocks */
     RCC->AHB2ENR  |= RCC_AHB2ENR_GPIOAEN;
     RCC->APB1ENR1 |= RCC_APB1ENR1_USART2EN;
-    RCC->AHB2ENR  |= RCC_AHB2ENR_ADC12EN;
+    RCC->APB2ENR  |= RCC_APB2ENR_TIM1EN;      /* TIM1 is on APB2 */
 
-    /* 3. PA2 = USART2 TX (AF7), PA3 = USART2 RX (AF7) */
+    /* 3. UART pins: PA2=TX, PA3=RX (AF7) */
     GPIOA->MODER &= ~((3U << (2*2)) | (3U << (2*3)));
     GPIOA->MODER |=  ((2U << (2*2)) | (2U << (2*3)));
     GPIOA->AFR[0] &= ~((0xFU << (2*4)) | (0xFU << (3*4)));
     GPIOA->AFR[0] |=  ((7U   << (2*4)) | (7U   << (3*4)));
 
-    /* 4. PA1 = analog (ADC2_IN2), PA6 = analog (ADC2_IN3) */
-    GPIOA->MODER |= (3U << (1*2));
-    GPIOA->MODER |= (3U << (6*2));
+    /* 4. PWM pins: PA8=TIM1_CH1 (AF6), PA9=TIM1_CH2 (AF6)
+     *
+     * PA8 and PA9 are in AFR[1] (covers pins 8-15).
+     * AFR[1] bit positions: pin 8 → bits [3:0], pin 9 → bits [7:4]
+     */
+    GPIOA->MODER &= ~((3U << (8*2)) | (3U << (9*2)));
+    GPIOA->MODER |=  ((2U << (8*2)) | (2U << (9*2)));   /* AF mode */
+    GPIOA->AFR[1] &= ~((0xFU << ((8-8)*4)) | (0xFU << ((9-8)*4)));
+    GPIOA->AFR[1] |=  ((6U   << ((8-8)*4)) | (6U   << ((9-8)*4)));   /* AF6 = TIM1 */
+    GPIOA->OSPEEDR |= ((3U << (8*2)) | (3U << (9*2)));   /* high speed for PWM */
 
-    /* 5. USART2: 9600 baud at 16MHz */
+    /* 5. UART: 9600 baud at 16MHz */
     USART2->BRR = 1667;
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 
-    /* 6. ADC2 clock = SYSCLK */
-    RCC->CCIPR |= RCC_CCIPR_ADC12SEL_1;
+    /* 6. TIM1 PWM setup
+     *
+     * PSC=0: timer clock = 16MHz (no prescaler)
+     * ARR=999: period = 1000 counts → f = 16MHz/1000 = 16kHz
+     *
+     * CCMR1:
+     *   OC1M [6:4] = 110 → PWM mode 1 on CH1
+     *   OC2M [14:12] = 110 → PWM mode 1 on CH2
+     *   OC1PE, OC2PE = 1 → preload enable (shadow registers)
+     *
+     * CCER:
+     *   CC1E, CC2E = 1 → enable CH1 and CH2 outputs
+     *
+     * BDTR:
+     *   MOE = 1 → main output enable (required for TIM1, advanced timer)
+     *   Without MOE the outputs stay low regardless of CCR values.
+     */
+    TIM1->PSC  = 0;
+    TIM1->ARR  = PWM_PERIOD - 1;   /* 999 */
+    TIM1->CCR1 = 0;
+    TIM1->CCR2 = 0;
 
-    /* 7. ADC voltage regulator */
-    ADC2->CR = 0;
-    ADC2->CR |= ADC_CR_ADVREGEN;
-    for (volatile int i = 0; i < 10000; i++);
+    /* PWM mode 1 on CH1 and CH2, preload enabled */
+    TIM1->CCMR1 = (6U << 4)  | TIM_CCMR1_OC1PE   /* CH1: PWM mode 1 + preload */
+                | (6U << 12) | TIM_CCMR1_OC2PE;   /* CH2: PWM mode 1 + preload */
 
-    /* 8. Calibrate ADC2 */
-    ADC2->CR |= ADC_CR_ADCAL;
-    while (ADC2->CR & ADC_CR_ADCAL);
+    /* Enable CH1 and CH2 outputs (active high) */
+    TIM1->CCER = TIM_CCER_CC1E | TIM_CCER_CC2E;
 
-    /* 9. Enable ADC2 */
-    ADC2->CR |= ADC_CR_ADEN;
-    while (!(ADC2->ISR & ADC_ISR_ADRDY));
+    /* Main output enable — MANDATORY for TIM1 */
+    TIM1->BDTR = TIM_BDTR_MOE;
+
+    /* Load ARR and CCR shadow registers, then start */
+    TIM1->EGR  = TIM_EGR_UG;
+    TIM1->CR1  = TIM_CR1_ARPE | TIM_CR1_CEN;   /* auto-reload preload + enable */
 
     uart_puts("BOOT OK\r\n");
-    uart_puts("DRV5055A1 dual sensor | 60mV/mT | range +/-22mT\r\n");
-    uart_puts("R=report  A=auto  S=stream  Z=recalibrate\r\n");
+    uart_puts("DRV8874 PWM test | TIM1 16kHz | IN/IN mode\r\n");
+    uart_puts("F=forward  R=reverse  B=brake  C=coast  +=duty+10%  -=duty-10%  P=print\r\n");
+    uart_puts("Starting in COAST (both pins low)\r\n");
     uart_puts("--------\r\n");
-
-    /* Run zero calibration at boot — ensure no field present */
-    uart_puts("Boot calibration (remove field sources now)...\r\n");
-    calibrate();
-
-    uint8_t auto_mode = 0;
 
     while (1) {
         if (USART2->ISR & USART_ISR_RXNE) {
             char c = (char)USART2->RDR;
-            if      (c == 'R') { do_full_report(); }
-            else if (c == 'A') { auto_mode = !auto_mode;
-                                 uart_puts(auto_mode ? "AUTO ON\r\n" : "AUTO OFF\r\n"); }
-            else if (c == 'S') { do_stream(); }
-            else if (c == 'Z') { calibrate(); }
-        }
-
-        if (auto_mode) {
-            do_full_report();
-            for (volatile uint32_t d = 0; d < 3200000UL; d++);
+            switch (c) {
+                case 'F': case 'f':
+                    current_mode = FORWARD;
+                    pwm_apply();
+                    uart_puts("-> FORWARD  ");
+                    print_state();
+                    break;
+                case 'R': case 'r':
+                    current_mode = REVERSE;
+                    pwm_apply();
+                    uart_puts("-> REVERSE  ");
+                    print_state();
+                    break;
+                case 'B': case 'b':
+                    current_mode = BRAKE;
+                    pwm_apply();
+                    uart_puts("-> BRAKE  ");
+                    print_state();
+                    break;
+                case 'C': case 'c':
+                    current_mode = COAST;
+                    pwm_apply();
+                    uart_puts("-> COAST  ");
+                    print_state();
+                    break;
+                case '+':
+                    if (duty + PWM_DUTY_STEP <= PWM_DUTY_MAX)
+                        duty += PWM_DUTY_STEP;
+                    pwm_apply();
+                    print_state();
+                    break;
+                case '-':
+                    if (duty >= PWM_DUTY_STEP + PWM_DUTY_MIN)
+                        duty -= PWM_DUTY_STEP;
+                    pwm_apply();
+                    print_state();
+                    break;
+                case 'P': case 'p':
+                    print_state();
+                    break;
+                default:
+                    break;
+            }
         }
     }
 }
