@@ -74,6 +74,29 @@
 #define PWM_MAX               PWM_ARR
 #define PWM_MIN               0
 
+/* ─── RX circular buffer ─────────────────────────────────────────────────── */
+#define RX_BUF_SIZE 16
+static volatile char     rx_buf[RX_BUF_SIZE];
+static volatile uint8_t  rx_head = 0;
+static volatile uint8_t  rx_tail = 0;
+
+void USART2_IRQHandler(void) {
+    if (USART2->ISR & USART_ISR_RXNE) {
+        rx_buf[rx_head] = (char)USART2->RDR;
+        rx_head = (rx_head + 1) % RX_BUF_SIZE;
+    }
+}
+
+static inline uint8_t rx_available(void) {
+    return rx_head != rx_tail;
+}
+
+static inline char rx_getc(void) {
+    char c = rx_buf[rx_tail];
+    rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+    return c;
+}
+
 typedef enum {
     DRV_COAST   = 0,
     DRV_FORWARD = 1,
@@ -337,8 +360,8 @@ static void do_stream(void) {
     uart_puts("STREAM START (any key to stop)\r\n");
     uart_puts("VBUS_RAW S1_RAW S2_RAW ISENSE_RAW\r\n");
     while (1) {
-        if (USART2->ISR & USART_ISR_RXNE) {
-            (void)USART2->RDR;
+        if (rx_available()) {
+            (void)rx_getc();
             break;
         }
         uint32_t vbus   = adc2_read(4);
@@ -369,6 +392,12 @@ int main(void) {
     RCC->AHB2ENR  |= RCC_AHB2ENR_ADC12EN;
     RCC->APB2ENR  |= RCC_APB2ENR_TIM1EN;
 
+    /* nSLEEP on PB6 — drive high to enable DRV8874 */
+    RCC->AHB2ENR  |= RCC_AHB2ENR_GPIOBEN;
+    GPIOB->MODER  &= ~(3U << (6*2));
+    GPIOB->MODER  |=  (1U << (6*2));   /* output */
+    GPIOB->BSRR    =  (1U << 6);       /* set high */
+
     /* 3. PA2=TX, PA3=RX (USART2, AF7) */
     GPIOA->MODER &= ~((3U << (2*2)) | (3U << (3*2)));
     GPIOA->MODER |=  ((2U << (2*2)) | (2U << (3*2)));
@@ -390,6 +419,8 @@ int main(void) {
     /* 6. USART2: 9600 baud at 16 MHz (BRR = 16000000 / 9600 = 1667) */
     USART2->BRR = 1667;
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+    USART2->CR1 |= USART_CR1_RXNEIE;          // enable RXNE interrupt
+    NVIC_EnableIRQ(USART2_IRQn);              // enable in NVIC
 
     /* 7. ADC2 clock = SYSCLK */
     RCC->CCIPR |= RCC_CCIPR_ADC12SEL_1;
@@ -442,8 +473,8 @@ int main(void) {
     /* ── Main loop ──────────────────────────────────────────────────────── */
     while (1) {
 
-        if (USART2->ISR & USART_ISR_RXNE) {
-            char c = (char)USART2->RDR;
+        if (rx_available()) {
+            char c = rx_getc();
 
             switch (c) {
 
@@ -518,6 +549,13 @@ int main(void) {
 
                 case 'P':
                     pwm_print_state();
+                    break;
+                
+                case 'N':
+                    GPIOB->BSRR = (1U << (6 + 16));  /* pull low  */
+                    for (volatile int i = 0; i < 10000; i++);  /* brief delay */
+                    GPIOB->BSRR = (1U << 6);          /* pull high */
+                    uart_puts("nSLEEP toggled\r\n");
                     break;
 
                 default:

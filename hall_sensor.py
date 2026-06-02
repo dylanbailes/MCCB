@@ -212,7 +212,7 @@ def flush_boot_messages(ser):
     ser.reset_input_buffer()
 
 # All valid single-character commands accepted by the firmware
-VALID_CMDS = {"R", "A", "S", "Z", "F", "V", "B", "C", "+", "-", "P"}
+VALID_CMDS = {"R", "A", "S", "Z", "F", "V", "B", "C", "+", "-", "P", "N"}
 
 
 # ── Modes ────────────────────────────────────────────────────────────────────────
@@ -385,7 +385,7 @@ def mode_interactive(ser):
             for l in lines:
                 print(f"  {l}")
 
-        elif cmd in ("F", "V", "B", "C", "+", "-", "P"):
+        elif cmd in ("F", "V", "B", "C", "+", "-", "P", "N"):
             # Single-line response from firmware (e.g. "FORWARD\r\nPWM: FORWARD  duty=50%  CCR=499\r\n")
             # Read until 2s timeout collects the short ack
             time.sleep(0.1)
