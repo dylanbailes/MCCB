@@ -28,6 +28,10 @@
  *  IN1=1    IN2=1   → Brake
  *  IN1=0    IN2=0   → Coast
  *
+ * ── DRV8874 Status Pins ─────────────────────────────────────────────────────
+ *  PB6 = nSLEEP (Output, Active Low) → HIGH = Awake, LOW = Sleep
+ *  PB7 = nFAULT (Input, Active Low)  → HIGH = OK, LOW = Fault (Overcurrent/Temp)
+ *
  * ── DRV5055A1 hall sensors ──────────────────────────────────────────────────
  *  Sensitivity: 60 mV/mT @ 3.3V, ratiometric (midscale = VCC/2)
  *  Range: ±22 mT. Boot calibration removes per-sensor DC offset.
@@ -45,7 +49,7 @@
  *  At 24V: V_ADC ≈ 2.18V → raw ≈ 2703
  *
  * ── UART commands ───────────────────────────────────────────────────────────
- *  'R' = single full report (hall + current + VBUS + PWM state)
+ *  'R' = single full report (hall + current + VBUS + PWM + DRV state)
  *  'A' = toggle auto-report (~200 ms interval)
  *  'S' = stream all four raw ADC channels until any keypress
  *  'Z' = re-run zero calibration (zero current + zero field required)
@@ -55,7 +59,9 @@
  *  'C' = coast
  *  '+' = duty +10% (clamped to 100%)
  *  '-' = duty -10% (clamped to 0%)
- *  'P' = print PWM state
+ *  'P' = print PWM + DRV state
+ *  'D' = print DRV state only
+ *  'N' = toggle nSLEEP (clears latched faults)
  */
 
 #include "stm32g4xx.h"
@@ -262,6 +268,23 @@ static void pwm_print_state(void) {
     uart_puts("\r\n");
 }
 
+/* ─── DRV Status Reporting ──────────────────────────────────────────────── */
+static void drv_print_status(void) {
+    /* nSLEEP is on PB6 (output, read from ODR). Active low. */
+    uint8_t nsleep_pin = (GPIOB->ODR >> 6) & 1U;
+    /* nFAULT is on PB7 (input, read from IDR). Active low. */
+    uint8_t nfault_pin = (GPIOB->IDR >> 7) & 1U;
+
+    uart_puts("DRV: nSLEEP=");
+    uart_putn(nsleep_pin);
+    uart_puts(nsleep_pin ? "(AWAKE) " : "(SLEEP) ");
+    
+    uart_puts("nFAULT=");
+    uart_putn(nfault_pin);
+    uart_puts(nfault_pin ? "(OK)" : "(FAULT)");
+    uart_puts("\r\n");
+}
+
 /* ─── Calibration ────────────────────────────────────────────────────────── */
 
 static void calibrate(void) {
@@ -349,8 +372,9 @@ static void do_full_report(void) {
     uart_puts("  AC_RMS_mT=");      uart_put_fixed2((int32_t)rms2_mt);
     uart_puts("\r\n");
 
-    /* Print PWM state inline with report */
+    /* Print PWM and DRV state inline with report */
     pwm_print_state();
+    drv_print_status();
 
     uart_puts("--------\r\n");
 }
@@ -397,6 +421,11 @@ int main(void) {
     GPIOB->MODER  &= ~(3U << (6*2));
     GPIOB->MODER  |=  (1U << (6*2));   /* output */
     GPIOB->BSRR    =  (1U << 6);       /* set high */
+
+    /* nFAULT on PB7 — input with pull-up (DRV8874 nFAULT is active-low open-drain) */
+    GPIOB->MODER  &= ~(3U << (7*2));   /* input mode (00) */
+    GPIOB->PUPDR  &= ~(3U << (7*2));
+    GPIOB->PUPDR  |=  (1U << (7*2));   /* pull-up */
 
     /* 3. PA2=TX, PA3=RX (USART2, AF7) */
     GPIOA->MODER &= ~((3U << (2*2)) | (3U << (3*2)));
@@ -460,8 +489,8 @@ int main(void) {
     uart_puts("BOOT OK\r\n");
     uart_puts("Hall: DRV5055A1 60mV/mT +/-22mT | Current: INA240A1 1V/A | VBUS: /11\r\n");
     uart_puts("PWM:  TIM1 16kHz | DRV8874 IN/IN mode | coast at boot\r\n");
-    uart_puts("Cmds: R=report  A=auto  S=stream  Z=recal\r\n");
-    uart_puts("      F=forward  V=reverse  B=brake  C=coast  +=duty+10%  -=duty-10%  P=pwm\r\n");
+    uart_puts("Cmds: R=report  A=auto  S=stream  Z=recal  D=drv status\r\n");
+    uart_puts("      F=forward  V=reverse  B=brake  C=coast  +=duty+10%  -=duty-10%  P=pwm  N=nSleep toggle\r\n");
     uart_puts("--------\r\n");
 
     /* 13. Boot calibration — coils must be off, no field sources */
@@ -549,13 +578,18 @@ int main(void) {
 
                 case 'P':
                     pwm_print_state();
+                    drv_print_status();
+                    break;
+
+                case 'D':
+                    drv_print_status();
                     break;
                 
                 case 'N':
                     GPIOB->BSRR = (1U << (6 + 16));  /* pull low  */
                     for (volatile int i = 0; i < 10000; i++);  /* brief delay */
                     GPIOB->BSRR = (1U << 6);          /* pull high */
-                    uart_puts("nSLEEP toggled\r\n");
+                    uart_puts("nSLEEP toggled (clears latched faults)\r\n");
                     break;
 
                 default:

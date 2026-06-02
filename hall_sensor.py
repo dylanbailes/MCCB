@@ -80,6 +80,7 @@ def open_port(port=PORT, baud=BAUD):
 #   S1(PA1): RMS_RAW=2031  AC_RMS_mT=0.01
 #   S2(PA6): RMS_RAW=2019  AC_RMS_mT=0.01
 #   PWM: COAST  duty=0%  CCR=0
+#   DRV: nSLEEP=1(AWAKE) nFAULT=1(OK)
 #   --------
 
 def read_report_lines(ser, timeout=3.0):
@@ -105,7 +106,8 @@ def parse_report(lines):
     Keys: vbus_v, vbus_raw, isense_a, isense_raw, isense_warn,
           s1_raw, s1_mt, s1_sat, s2_raw, s2_mt, s2_sat,
           s1_rms_raw, s1_ac_rms_mt, s2_rms_raw, s2_ac_rms_mt,
-          pwm_mode, pwm_duty_pct, pwm_ccr
+          pwm_mode, pwm_duty_pct, pwm_ccr,
+          drv_nsleep, drv_nsleep_state, drv_nfault, drv_nfault_state
     """
     data = {}
 
@@ -149,6 +151,15 @@ def parse_report(lines):
                 data["pwm_duty_pct"] = m.group(2)
                 data["pwm_ccr"]      = m.group(3)
 
+        elif line.startswith("DRV:"):
+            # "DRV: nSLEEP=1(AWAKE) nFAULT=1(OK)"
+            m = re.match(r'DRV:\s+nSLEEP=(\d+)\((\w+)\)\s+nFAULT=(\d+)\((\w+)\)', line)
+            if m:
+                data["drv_nsleep"]       = m.group(1)
+                data["drv_nsleep_state"] = m.group(2)
+                data["drv_nfault"]       = m.group(3)
+                data["drv_nfault_state"] = m.group(4)
+
     if not all(k in data for k in ("s1_raw", "s2_raw")):
         return None
     return data
@@ -174,6 +185,18 @@ def print_report(data, timestamp=None):
     print(f"  S2 (PA6):  RMS_RAW={data.get('s2_rms_raw','?'):>4}  AC_RMS_mT={data.get('s2_ac_rms_mt','?'):>7}")
     print(f"  ── PWM ────────────────────────────────────────")
     print(f"  Mode:      {data.get('pwm_mode','?'):<10}  duty={data.get('pwm_duty_pct','?'):>3}%  CCR={data.get('pwm_ccr','?')}")
+    
+    print(f"  ── DRV Status ─────────────────────────────────")
+    nsleep_val = data.get('drv_nsleep', '?')
+    nsleep_state = data.get('drv_nsleep_state', '?')
+    nfault_val = data.get('drv_nfault', '?')
+    nfault_state = data.get('drv_nfault_state', '?')
+    
+    swarn = " ⚠ SLEEPING" if nsleep_state == "SLEEP" else ""
+    fwarn = " ⚠ FAULT!" if nfault_state == "FAULT" else ""
+    
+    print(f"  nSLEEP:    {nsleep_val} ({nsleep_state}){swarn}")
+    print(f"  nFAULT:    {nfault_val} ({nfault_state}){fwarn}")
 
 
 # ── CSV logging ──────────────────────────────────────────────────────────────────
@@ -187,6 +210,7 @@ CSV_FIELDS = [
     "s1_rms_raw", "s1_ac_rms_mt",
     "s2_rms_raw", "s2_ac_rms_mt",
     "pwm_mode", "pwm_duty_pct", "pwm_ccr",
+    "drv_nsleep", "drv_nsleep_state", "drv_nfault", "drv_nfault_state",
 ]
 
 def open_csv():
@@ -212,7 +236,7 @@ def flush_boot_messages(ser):
     ser.reset_input_buffer()
 
 # All valid single-character commands accepted by the firmware
-VALID_CMDS = {"R", "A", "S", "Z", "F", "V", "B", "C", "+", "-", "P", "N"}
+VALID_CMDS = {"R", "A", "S", "Z", "F", "V", "B", "C", "+", "-", "P", "N", "D"}
 
 
 # ── Modes ────────────────────────────────────────────────────────────────────────
@@ -322,7 +346,7 @@ def mode_interactive(ser):
     print("Commands:")
     print("  R=report   A=auto     S=stream   Z=recalibrate")
     print("  F=forward  V=reverse  B=brake    C=coast")
-    print("  +=duty+10% -=duty-10% P=pwm state  Q=quit")
+    print("  +=duty+10% -=duty-10% P=pwm state  D=drv status  N=nSleep toggle  Q=quit")
     print("-" * 60)
 
     # Drain any boot banner
@@ -385,7 +409,7 @@ def mode_interactive(ser):
             for l in lines:
                 print(f"  {l}")
 
-        elif cmd in ("F", "V", "B", "C", "+", "-", "P", "N"):
+        elif cmd in ("F", "V", "B", "C", "+", "-", "P", "N", "D"):
             # Single-line response from firmware (e.g. "FORWARD\r\nPWM: FORWARD  duty=50%  CCR=499\r\n")
             # Read until 2s timeout collects the short ack
             time.sleep(0.1)
